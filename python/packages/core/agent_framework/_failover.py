@@ -17,7 +17,7 @@ from ._feature_stage import ExperimentalFeature, experimental
 from ._middleware import ChatMiddlewareLayer, MiddlewareException
 from ._sessions import is_local_history_conversation_id
 from ._tools import FunctionInvocationLayer, ResponseModelBoundT
-from ._types import ChatResponse, ChatResponseUpdate, Message, ResponseStream
+from ._types import ChatResponse, ChatResponseUpdate, Content, Message, ResponseStream
 from .exceptions import ChatClientInvalidRequestException, ResponseInvalidatedException
 
 if sys.version_info >= (3, 13):
@@ -44,7 +44,11 @@ FailoverPredicate = Callable[[Exception], bool]
 """Decide whether a failed chat client attempt may be retried on the next chat client."""
 
 _FAILOVER_METADATA_KEY = "agent_framework.failover"
-"""Message ``additional_properties`` namespace recording which candidate produced a message's reasoning."""
+"""Reasoning ``Content.additional_properties`` namespace recording which candidate produced the reasoning.
+
+It is stored on the content rather than the message because streamed messages are rebuilt from updates, which keeps
+content metadata but not message metadata.
+"""
 
 _CANDIDATE_SESSION_KEY = "_agent_framework_failover_session"
 """Request-local client kwarg that carries the caller's session past this client's chat middleware layer."""
@@ -65,8 +69,8 @@ def _client_source(client: SupportsChatGetResponse[Any]) -> str:
     return hashlib.sha256(identity.encode("utf-8")).hexdigest()[:16]
 
 
-def _message_source(message: Message) -> str | None:
-    metadata = message.additional_properties.get(_FAILOVER_METADATA_KEY)
+def _content_source(content: Content) -> str | None:
+    metadata = content.additional_properties.get(_FAILOVER_METADATA_KEY)
     if isinstance(metadata, Mapping):
         source = cast(Mapping[str, Any], metadata).get("source")
         if isinstance(source, str):
@@ -74,15 +78,22 @@ def _message_source(message: Message) -> str | None:
     return None
 
 
+def _is_foreign_reasoning(content: Content, accepted: frozenset[str]) -> bool:
+    if content.type != "text_reasoning":
+        return False
+    source = _content_source(content)
+    return source is not None and source not in accepted
+
+
 def _group_annotation(message: Message) -> Mapping[str, Any] | None:
     annotation = message.additional_properties.get(GROUP_ANNOTATION_KEY)
     return cast(Mapping[str, Any], annotation) if isinstance(annotation, Mapping) else None
 
 
-def _without_reasoning(message: Message) -> Message:
-    """Return a copy of ``message`` without reasoning contents or a group reasoning flag."""
+def _without_reasoning(message: Message, accepted: frozenset[str]) -> Message:
+    """Return a copy of ``message`` without foreign reasoning contents or a group reasoning flag."""
     projected = copy.copy(message)
-    projected.contents = [content for content in message.contents if content.type != "text_reasoning"]
+    projected.contents = [content for content in message.contents if not _is_foreign_reasoning(content, accepted)]
     projected.additional_properties = dict(message.additional_properties)
     annotation = _group_annotation(message)
     if annotation is not None and annotation.get(GROUP_HAS_REASONING_KEY) is True:
@@ -132,11 +143,12 @@ class FailoverChatClient(
     Agents using this client keep history locally, as they do for any client that does not store history by default.
 
     Reasoning is provider-specific: a provider can only replay reasoning it produced itself (for example, OpenAI
-    requires its encrypted reasoning payload). This client records which client produced each response's reasoning
-    and omits that reasoning from the copy of the conversation sent to a different client, together with the
-    compaction flag that marks its group as containing reasoning. Function calls and results are always sent, and the
-    caller's transcript is never modified. Reasoning in history that this client did not record (for example, from
-    an earlier streamed run) is sent unchanged.
+    requires its encrypted reasoning payload). This client records on each reasoning content, in streamed and
+    non-streamed responses, which client produced it. That record is kept in the conversation history, so it also
+    applies to later runs. Reasoning produced by a different client is omitted from the copy of the conversation sent
+    to a client, together with the compaction flag that marks its group as containing reasoning. Function calls and
+    results are always sent, and the caller's transcript is never modified. Reasoning without a record (for example,
+    history created before this client was used) is sent unchanged.
 
     The chat clients are caller-owned: ``close()`` and ``async with`` do not close them.
 
@@ -376,7 +388,8 @@ class FailoverChatClient(
                     raise
                 self._log_failover(index, client, exception)
                 continue
-            self._record_reasoning_source(index, response)
+            for message in response.messages:
+                self._record_reasoning_source(index, message.contents)
             return response
         raise AssertionError("unreachable")  # pragma: no cover
 
@@ -424,6 +437,8 @@ class FailoverChatClient(
                             self._log_failover(index, client, exception)
                             failed = True
                             break
+                        # Record on the streamed contents too: callers rebuild streamed history from updates.
+                        self._record_reasoning_source(index, update.contents)
                         if not released and not update.contents:
                             held.append(update)
                             continue
@@ -440,7 +455,8 @@ class FailoverChatClient(
                     final_response = await attempt.get_final_response()
                 for held_update in held:
                     yield held_update
-                self._record_reasoning_source(index, final_response)
+                for message in final_response.messages:
+                    self._record_reasoning_source(index, message.contents)
                 final_responses.append(final_response)
                 return
 
@@ -466,6 +482,10 @@ class FailoverChatClient(
         attempt_options = dict(options)
         if getattr(client, "STORES_BY_DEFAULT", False) is True and attempt_options.get("store") is None:
             attempt_options["store"] = False
+        attempt_client_kwargs = dict(client_kwargs)
+        if isinstance(client, FailoverChatClient) and (session := attempt_client_kwargs.get("session")) is not None:
+            # A nested failover client is entered below its own get_response, so hand it the session the same way.
+            attempt_client_kwargs[_CANDIDATE_SESSION_KEY] = session
         target: Any = client
         if isinstance(client, FunctionInvocationLayer):
             # This is the same call a client's own function-invocation loop makes for each model call: it enters the
@@ -479,17 +499,17 @@ class FailoverChatClient(
             messages=self._messages_for_client(index, messages),
             stream=stream,
             options=attempt_options,
-            client_kwargs=dict(client_kwargs),
+            client_kwargs=attempt_client_kwargs,
         )
 
-    def _record_reasoning_source(self, index: int, response: ChatResponse[Any]) -> None:
-        """Record which client produced the reasoning in ``response``, keeping a nested client's record."""
+    def _record_reasoning_source(self, index: int, contents: Sequence[Content]) -> None:
+        """Record which client produced each reasoning content, keeping a nested client's record."""
         source = self._candidate_sources[index]
         if source is None:
             return
-        for message in response.messages:
-            if any(content.type == "text_reasoning" for content in message.contents):
-                message.additional_properties.setdefault(_FAILOVER_METADATA_KEY, {"source": source})
+        for content in contents:
+            if content.type == "text_reasoning":
+                content.additional_properties.setdefault(_FAILOVER_METADATA_KEY, {"source": source})
 
     def _messages_for_client(self, index: int, messages: Sequence[Message]) -> Sequence[Message]:
         """Return the conversation to send to the client at ``index``.
@@ -502,17 +522,14 @@ class FailoverChatClient(
         projected: list[Message] | None = None
         foreign_groups: set[Any] = set()
         for position, message in enumerate(messages):
-            source = _message_source(message)
-            if source is None or source in accepted:
-                continue
-            if not any(content.type == "text_reasoning" for content in message.contents):
+            if not any(_is_foreign_reasoning(content, accepted) for content in message.contents):
                 continue
             if projected is None:
                 projected = list(messages)
             annotation = _group_annotation(message)
             if annotation is not None and annotation.get(GROUP_ID_KEY) is not None:
                 foreign_groups.add(annotation[GROUP_ID_KEY])
-            projected[position] = _without_reasoning(message)
+            projected[position] = _without_reasoning(message, accepted)
         if projected is None:
             return messages
         if foreign_groups:
@@ -523,7 +540,7 @@ class FailoverChatClient(
                     and annotation.get(GROUP_ID_KEY) in foreign_groups
                     and annotation.get(GROUP_HAS_REASONING_KEY) is True
                 ):
-                    projected[position] = _without_reasoning(message)
+                    projected[position] = _without_reasoning(message, accepted)
         return [message for message in projected if message.contents]
 
     def _ensure_client_managed_history(self, options: Mapping[str, Any]) -> None:

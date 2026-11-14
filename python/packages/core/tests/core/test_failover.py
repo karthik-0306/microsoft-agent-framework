@@ -657,6 +657,30 @@ async def test_candidate_chat_middleware_receives_the_caller_session(stream: boo
     assert seen_sessions == [session, session]
 
 
+@pytest.mark.parametrize("stream", [False, True], ids=["non-streaming", "streaming"])
+async def test_nested_failover_candidates_receive_the_caller_session(stream: bool) -> None:
+    seen_sessions: list[Any] = []
+
+    class _RecordSession(ChatMiddleware):
+        async def process(self, context: ChatContext, call_next: Any) -> None:
+            seen_sessions.append(context.session)
+            await call_next()
+
+    regional = FailoverChatClient([
+        _ScriptedClient([_rate_limited("east")], middleware=[_RecordSession()]),
+        _ScriptedClient([_text_response("ok")], middleware=[_RecordSession()]),
+    ])
+    agent = Agent(client=FailoverChatClient([regional, _ScriptedClient()]))
+    session = agent.create_session()
+
+    if stream:
+        await agent.run("hi", session=session, stream=True).get_final_response()
+    else:
+        await agent.run("hi", session=session)
+
+    assert seen_sessions == [session, session]
+
+
 async def test_reasoning_from_another_client_is_not_sent_to_the_fallback(
     send_email: Any, sent_emails: list[str]
 ) -> None:
@@ -678,6 +702,31 @@ async def test_reasoning_from_another_client_is_not_sent_to_the_fallback(
     assert {"function_call", "function_result"} <= set(fallback_types)
     # The caller-visible transcript is unchanged.
     assert "text_reasoning" in _content_types(response.messages)
+
+
+@pytest.mark.parametrize("first_run_stream", [False, True], ids=["non-streamed-history", "streamed-history"])
+async def test_reasoning_recorded_in_an_earlier_run_is_not_sent_to_another_client(
+    first_run_stream: bool, send_email: Any, sent_emails: list[str]
+) -> None:
+    primary = _ScriptedClient(
+        [_reasoning_tool_call_response(), _text_response("first answer"), _rate_limited("primary")],
+        model="local-model",
+    )
+    fallback = _ScriptedClient([_text_response("second answer")], model="hosted-model")
+    agent = Agent(client=FailoverChatClient([primary, fallback]), tools=[send_email])
+    session = agent.create_session()
+
+    if first_run_stream:
+        await agent.run("Email the CFO.", session=session, stream=True).get_final_response()
+    else:
+        await agent.run("Email the CFO.", session=session)
+    second = await agent.run("Thanks.", session=session)
+
+    assert second.text == "second answer"
+    assert sent_emails == ["cfo@contoso.com"]
+    fallback_types = _content_types(fallback.calls[0]["messages"])
+    assert "text_reasoning" not in fallback_types
+    assert {"function_call", "function_result"} <= set(fallback_types)
 
 
 async def test_nested_failover_keeps_reasoning_for_the_client_that_produced_it(

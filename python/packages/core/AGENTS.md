@@ -86,9 +86,11 @@ agent_framework/
   `STORES_BY_DEFAULT` receive `store=False` per attempt when `store` is unset. The caller's session is carried past
   the failover client's own chat middleware layer through a request-local client kwarg, so candidate chat middleware
   receives it. Reasoning is provider-specific: the client records a hashed client-type/model/service-URL source on
-  each response message that contains reasoning (`additional_properties["agent_framework.failover"]`, first writer
-  wins so nested clients keep the innermost producer) and omits that reasoning, plus the group's compaction
-  `has_reasoning` flag, from the per-attempt copy sent to a candidate that does not accept that source. Calls and
+  each `text_reasoning` content, in streamed updates and final responses
+  (`Content.additional_properties["agent_framework.failover"]`; content-level so it survives streamed-history
+  aggregation and persistence; first writer wins so nested clients keep the innermost producer) and omits that
+  reasoning, plus the group's compaction `has_reasoning` flag, from the per-attempt copy sent to a candidate that
+  does not accept that source. Calls and
   results are always sent, the caller's transcript is not modified, and unrecorded reasoning is sent unchanged.
   Candidates are caller-owned and not closed.
 
