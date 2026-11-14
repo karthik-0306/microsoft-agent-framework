@@ -80,9 +80,17 @@ agent_framework/
   `ResponseInvalidatedException` and `MiddlewareException` always propagate. Streaming fails over only before an
   update with contents is released; content-less updates are held until then and discarded with a failed attempt.
   History must be client-managed: `store=True` or a service continuation option (the union of candidates'
-  `SERVICE_CONTINUATION_OPTION_NAMES`) raises `ChatClientInvalidRequestException` before any call, and candidates
-  with `STORES_BY_DEFAULT` receive `store=False` per attempt when `store` is unset. Candidates are caller-owned and
-  not closed.
+  `SERVICE_CONTINUATION_OPTION_NAMES`, including a nested failover client's computed union) raises
+  `ChatClientInvalidRequestException` in `get_response` before the function-invocation loop resolves approvals, so
+  no approved tool runs first; the per-model-call check remains for middleware-modified options. Candidates with
+  `STORES_BY_DEFAULT` receive `store=False` per attempt when `store` is unset. The caller's session is carried past
+  the failover client's own chat middleware layer through a request-local client kwarg, so candidate chat middleware
+  receives it. Reasoning is provider-specific: the client records a hashed client-type/model/service-URL source on
+  each response message that contains reasoning (`additional_properties["agent_framework.failover"]`, first writer
+  wins so nested clients keep the innermost producer) and omits that reasoning, plus the group's compaction
+  `has_reasoning` flag, from the per-attempt copy sent to a candidate that does not accept that source. Calls and
+  results are always sent, the caller's transcript is not modified, and unrecorded reasoning is sent unchanged.
+  Candidates are caller-owned and not closed.
 
 ### Types (`_types.py`)
 

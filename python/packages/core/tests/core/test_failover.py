@@ -46,8 +46,10 @@ class _RawScriptedClient(BaseChatClient[Any]):
         *,
         raise_on_call: BaseException | None = None,
         finalize_error: Exception | None = None,
+        model: str | None = None,
     ) -> None:
         super().__init__()
+        self.model = model
         self._steps = list(steps)
         self._raise_on_call = raise_on_call
         self._finalize_error = finalize_error
@@ -104,8 +106,15 @@ class _ScriptedClient(FunctionInvocationLayer[Any], ChatMiddlewareLayer[Any], _R
         raise_on_call: BaseException | None = None,
         finalize_error: Exception | None = None,
         middleware: Sequence[Any] | None = None,
+        model: str | None = None,
     ) -> None:
-        super().__init__(middleware=middleware, steps=steps, raise_on_call=raise_on_call, finalize_error=finalize_error)
+        super().__init__(
+            middleware=middleware,
+            steps=steps,
+            raise_on_call=raise_on_call,
+            finalize_error=finalize_error,
+            model=model,
+        )
 
 
 class _StoringScriptedClient(_ScriptedClient):
@@ -567,3 +576,174 @@ def test_failover_client_is_experimental() -> None:
     from agent_framework import ExperimentalFeature
 
     assert getattr(FailoverChatClient, "__feature_id__", None) == ExperimentalFeature.CHAT_CLIENT_FAILOVER.value
+
+
+# region Review regressions
+
+
+def _reasoning_tool_call_response(call_id: str = "call-1") -> ChatResponse:
+    # Plain-text thinking without a provider replay payload, as local providers such as Ollama emit it.
+    reasoning = Content.from_text_reasoning(text="I should email the CFO.")
+    call = Content.from_function_call(call_id=call_id, name="send_email", arguments={"to": "cfo@contoso.com"})
+    return ChatResponse(messages=Message(role="assistant", contents=[reasoning, call]))
+
+
+def _content_types(messages: Sequence[Message]) -> list[str]:
+    return [content.type for message in messages for content in message.contents]
+
+
+@pytest.mark.parametrize("stream", [False, True], ids=["non-streaming", "streaming"])
+async def test_approval_resume_rejects_service_managed_history_before_running_tools(stream: bool) -> None:
+    executed: list[str] = []
+
+    @tool(approval_mode="always_require")
+    def delete_records(table: str) -> str:
+        """Delete records."""
+        executed.append(table)
+        return "deleted"
+
+    call = Content.from_function_call(call_id="call-1", name="delete_records", arguments={"table": "orders"})
+    primary = _ScriptedClient([ChatResponse(messages=Message(role="assistant", contents=[call]))])
+    agent = Agent(client=FailoverChatClient([primary, _ScriptedClient()]), tools=[delete_records])
+    session = agent.create_session()
+    first = await agent.run("Delete the orders table.", session=session)
+    approval = first.user_input_requests[0].to_function_approval_response(approved=True)
+
+    with pytest.raises(ChatClientInvalidRequestException, match="client-managed history"):
+        if stream:
+            await agent.run(approval, session=session, stream=True, options={"store": True}).get_final_response()
+        else:
+            await agent.run(approval, session=session, options={"store": True})
+
+    assert executed == []
+
+
+async def test_nested_failover_rejects_inner_continuation_options_before_any_call() -> None:
+    inner_primary = _ResponsesLikeScriptedClient()
+    inner_fallback = _ScriptedClient()
+    outer_fallback = _ScriptedClient()
+    client = FailoverChatClient([FailoverChatClient([inner_primary, inner_fallback]), outer_fallback])
+
+    with pytest.raises(ChatClientInvalidRequestException, match="previous_response_id"):
+        await client.get_response(
+            [Message(role="user", contents=["hi"])],
+            options=cast("ChatOptions[Any]", {"previous_response_id": "resp_123"}),
+        )
+
+    assert inner_primary.calls == []
+    assert inner_fallback.calls == []
+    assert outer_fallback.calls == []
+
+
+@pytest.mark.parametrize("stream", [False, True], ids=["non-streaming", "streaming"])
+async def test_candidate_chat_middleware_receives_the_caller_session(stream: bool) -> None:
+    seen_sessions: list[Any] = []
+
+    class _RecordSession(ChatMiddleware):
+        async def process(self, context: ChatContext, call_next: Any) -> None:
+            seen_sessions.append(context.session)
+            await call_next()
+
+    primary = _ScriptedClient([_rate_limited("primary")], middleware=[_RecordSession()])
+    fallback = _ScriptedClient([_text_response("ok")], middleware=[_RecordSession()])
+    agent = Agent(client=FailoverChatClient([primary, fallback]))
+    session = agent.create_session()
+
+    if stream:
+        await agent.run("hi", session=session, stream=True).get_final_response()
+    else:
+        await agent.run("hi", session=session)
+
+    assert seen_sessions == [session, session]
+
+
+async def test_reasoning_from_another_client_is_not_sent_to_the_fallback(
+    send_email: Any, sent_emails: list[str]
+) -> None:
+    primary = _ScriptedClient([_reasoning_tool_call_response(), _rate_limited("primary")], model="local-model")
+    fallback = _ScriptedClient([_text_response("done")], model="hosted-model")
+    client = FailoverChatClient([primary, fallback])
+
+    response = await client.get_response(
+        [Message(role="user", contents=["Email the CFO."])], options={"tools": [send_email]}
+    )
+
+    assert response.text == "done"
+    assert sent_emails == ["cfo@contoso.com"]
+    # The client that produced the reasoning still receives it on its next model call.
+    assert "text_reasoning" in _content_types(primary.calls[1]["messages"])
+    # A different client receives the tool call and result, but not reasoning it cannot replay.
+    fallback_types = _content_types(fallback.calls[0]["messages"])
+    assert "text_reasoning" not in fallback_types
+    assert {"function_call", "function_result"} <= set(fallback_types)
+    # The caller-visible transcript is unchanged.
+    assert "text_reasoning" in _content_types(response.messages)
+
+
+async def test_nested_failover_keeps_reasoning_for_the_client_that_produced_it(
+    send_email: Any, sent_emails: list[str]
+) -> None:
+    producer = _ScriptedClient([_reasoning_tool_call_response(), _text_response("producer answered")], model="a")
+    regional = FailoverChatClient([producer, _ScriptedClient(model="b")])
+    client = FailoverChatClient([regional, _ScriptedClient(model="c")])
+
+    response = await client.get_response(
+        [Message(role="user", contents=["Email the CFO."])], options={"tools": [send_email]}
+    )
+
+    assert response.text == "producer answered"
+    assert sent_emails == ["cfo@contoso.com"]
+    assert "text_reasoning" in _content_types(producer.calls[1]["messages"])
+
+
+@pytest.mark.parametrize("annotate", [False, True], ids=["plain-history", "compaction-annotated-history"])
+async def test_openai_fallback_accepts_history_with_another_providers_reasoning(
+    annotate: bool, send_email: Any, sent_emails: list[str]
+) -> None:
+    pytest.importorskip("agent_framework_openai")
+    from unittest.mock import MagicMock, patch
+
+    from openai.types.responses import Response
+
+    from agent_framework import CharacterEstimatorTokenizer
+    from agent_framework.openai import OpenAIChatClient
+
+    sdk_response = Response.model_validate({
+        "id": "resp_fallback",
+        "object": "response",
+        "created_at": 0,
+        "status": "completed",
+        "model": "gpt-test",
+        "output": [
+            {
+                "type": "message",
+                "id": "msg_1",
+                "role": "assistant",
+                "status": "completed",
+                "content": [{"type": "output_text", "text": "Done.", "annotations": []}],
+            }
+        ],
+        "parallel_tool_calls": True,
+        "tool_choice": "auto",
+        "tools": [],
+    })
+    # The client reads responses through the SDK's raw-response wrapper, as in the OpenAI package tests.
+    raw_response = MagicMock(headers={})
+    raw_response.parse.return_value = sdk_response
+
+    fallback = OpenAIChatClient(model="gpt-test", api_key="test-key")
+    primary = _ScriptedClient([_reasoning_tool_call_response(), _rate_limited("primary")], model="local-model")
+    client = FailoverChatClient([primary, fallback], tokenizer=CharacterEstimatorTokenizer() if annotate else None)
+
+    with patch.object(fallback.client.responses, "create", return_value=raw_response) as create:
+        response = await client.get_response(
+            [Message(role="user", contents=["Email the CFO."])], options={"tools": [send_email]}
+        )
+
+    assert response.text == "Done."
+    assert sent_emails == ["cfo@contoso.com"]
+    # The real OpenAI request preparation accepted the conversation and sent it to the service once.
+    assert create.call_count == 1
+    sent_item_types = [item.get("type") for item in create.call_args.kwargs["input"]]
+    assert "reasoning" not in sent_item_types
+    assert {"function_call", "function_call_output"} <= set(sent_item_types)

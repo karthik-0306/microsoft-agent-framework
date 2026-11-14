@@ -7,7 +7,7 @@ from typing import Annotated
 
 from agent_framework import Agent, FailoverChatClient, tool
 from agent_framework.foundry import FoundryChatClient
-from azure.identity import AzureCliCredential
+from azure.identity.aio import AzureCliCredential
 from dotenv import load_dotenv
 from pydantic import Field
 
@@ -49,33 +49,36 @@ async def main() -> None:
     # Show the warning that FailoverChatClient logs for each failover.
     logging.basicConfig(level=logging.WARNING, format="%(levelname)s %(message)s")
 
-    credential = AzureCliCredential()
     project_endpoint = os.environ["FOUNDRY_PROJECT_ENDPOINT"]
 
-    # 1. The primary client fails on every call because the deployment does not exist.
-    primary = FoundryChatClient(
-        project_endpoint=project_endpoint,
-        model="deployment-that-does-not-exist",
-        credential=credential,
-    )
-    # 2. The fallback client uses a working deployment.
-    fallback = FoundryChatClient(
-        project_endpoint=project_endpoint,
-        model=os.environ["FOUNDRY_MODEL"],
-        credential=credential,
-    )
+    # FailoverChatClient does not close the clients it is given, so the sample owns the credential and both
+    # clients and closes them on success, failure, or cancellation.
+    async with (
+        AzureCliCredential() as credential,
+        # 1. The primary client fails on every call because the deployment does not exist.
+        FoundryChatClient(
+            project_endpoint=project_endpoint,
+            model="deployment-that-does-not-exist",
+            credential=credential,
+        ) as primary,
+        # 2. The fallback client uses a working deployment.
+        FoundryChatClient(
+            project_endpoint=project_endpoint,
+            model=os.environ["FOUNDRY_MODEL"],
+            credential=credential,
+        ) as fallback,
+    ):
+        # 3. Tools, function middleware, and agent middleware are configured once, on the failover client or agent.
+        agent = Agent(
+            client=FailoverChatClient([primary, fallback]),
+            name="SupportAgent",
+            instructions="You are a customer support agent. Use the tools you have to resolve requests.",
+            tools=[issue_refund],
+        )
 
-    # 3. Tools, function middleware, and agent middleware are configured once, on the failover client or agent.
-    agent = Agent(
-        client=FailoverChatClient([primary, fallback]),
-        name="SupportAgent",
-        instructions="You are a customer support agent. Use the tools you have to resolve requests.",
-        tools=[issue_refund],
-    )
-
-    response = await agent.run("Please refund order 123 and confirm when it is done.")
-    print(f"Agent: {response.text}")
-    print(f"Refunds issued: {refunds_issued}")
+        response = await agent.run("Please refund order 123 and confirm when it is done.")
+        print(f"Agent: {response.text}")
+        print(f"Refunds issued: {refunds_issued}")
 
 
 if __name__ == "__main__":

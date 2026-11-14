@@ -4,16 +4,19 @@
 
 from __future__ import annotations
 
+import copy
+import hashlib
 import logging
 import sys
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
-from typing import TYPE_CHECKING, Any, Generic, TypedDict, cast
+from typing import TYPE_CHECKING, Any, Generic, Literal, TypedDict, cast, overload
 
 from ._clients import BaseChatClient, SupportsChatGetResponse
+from ._compaction import GROUP_ANNOTATION_KEY, GROUP_HAS_REASONING_KEY, GROUP_ID_KEY
 from ._feature_stage import ExperimentalFeature, experimental
 from ._middleware import ChatMiddlewareLayer, MiddlewareException
 from ._sessions import is_local_history_conversation_id
-from ._tools import FunctionInvocationLayer
+from ._tools import FunctionInvocationLayer, ResponseModelBoundT
 from ._types import ChatResponse, ChatResponseUpdate, Message, ResponseStream
 from .exceptions import ChatClientInvalidRequestException, ResponseInvalidatedException
 
@@ -26,7 +29,7 @@ if TYPE_CHECKING:
     from ._compaction import CompactionStrategy, TokenizerProtocol
     from ._middleware import ChatAndFunctionMiddlewareTypes
     from ._tools import FunctionInvocationConfiguration
-    from ._types import ChatOptions  # referenced by the OptionsCoT default
+    from ._types import ChatOptions
 
 logger = logging.getLogger("agent_framework")
 
@@ -39,6 +42,52 @@ OptionsCoT = TypeVar(
 
 FailoverPredicate = Callable[[Exception], bool]
 """Decide whether a failed chat client attempt may be retried on the next chat client."""
+
+_FAILOVER_METADATA_KEY = "agent_framework.failover"
+"""Message ``additional_properties`` namespace recording which candidate produced a message's reasoning."""
+
+_CANDIDATE_SESSION_KEY = "_agent_framework_failover_session"
+"""Request-local client kwarg that carries the caller's session past this client's chat middleware layer."""
+
+
+def _client_source(client: SupportsChatGetResponse[Any]) -> str:
+    """Return a stable, opaque identity for the service a client calls.
+
+    The identity combines the client type, model, and service URL, so two deployments of the same model in
+    different regions are different sources. It is hashed so endpoints are not copied into persisted history.
+    """
+    service_url = getattr(client, "service_url", None)
+    try:
+        url = service_url() if callable(service_url) else None
+    except Exception:
+        url = None
+    identity = f"{type(client).__module__}.{type(client).__qualname__}|{getattr(client, 'model', None)}|{url}"
+    return hashlib.sha256(identity.encode("utf-8")).hexdigest()[:16]
+
+
+def _message_source(message: Message) -> str | None:
+    metadata = message.additional_properties.get(_FAILOVER_METADATA_KEY)
+    if isinstance(metadata, Mapping):
+        source = cast(Mapping[str, Any], metadata).get("source")
+        if isinstance(source, str):
+            return source
+    return None
+
+
+def _group_annotation(message: Message) -> Mapping[str, Any] | None:
+    annotation = message.additional_properties.get(GROUP_ANNOTATION_KEY)
+    return cast(Mapping[str, Any], annotation) if isinstance(annotation, Mapping) else None
+
+
+def _without_reasoning(message: Message) -> Message:
+    """Return a copy of ``message`` without reasoning contents or a group reasoning flag."""
+    projected = copy.copy(message)
+    projected.contents = [content for content in message.contents if content.type != "text_reasoning"]
+    projected.additional_properties = dict(message.additional_properties)
+    annotation = _group_annotation(message)
+    if annotation is not None and annotation.get(GROUP_HAS_REASONING_KEY) is True:
+        projected.additional_properties[GROUP_ANNOTATION_KEY] = {**annotation, GROUP_HAS_REASONING_KEY: False}
+    return projected
 
 
 @experimental(feature_id=ExperimentalFeature.CHAT_CLIENT_FAILOVER)
@@ -59,7 +108,8 @@ class FailoverChatClient(
     Each attempt goes through the selected client's chat middleware and telemetry layers but not its
     function-invocation layer. Configure tools, function middleware, and ``function_invocation_configuration`` on
     the ``FailoverChatClient`` (or the agent that uses it). Chat middleware configured on the failover client, or
-    passed by an agent, runs once per model call around all attempts.
+    passed by an agent, runs once per model call around all attempts. Each client's own chat middleware runs for
+    each of its attempts and receives the caller's session.
 
     Failover rules:
 
@@ -76,10 +126,17 @@ class FailoverChatClient(
 
     Conversation history must be client-managed because history stored by one service cannot be read by another.
     Requests that set ``store=True`` or carry a service-managed continuation (such as ``conversation_id`` or
-    ``previous_response_id``) are rejected with ``ChatClientInvalidRequestException`` before any client is called.
-    Clients that store history by default (``STORES_BY_DEFAULT``) receive ``store=False`` for their attempt unless
-    the request sets ``store`` explicitly. Agents using this client keep history locally, as they do for any
-    client that does not store history by default.
+    ``previous_response_id``) are rejected with ``ChatClientInvalidRequestException`` before the function-invocation
+    loop starts, so no approved tool runs for a request that cannot be served. Clients that store history by default
+    (``STORES_BY_DEFAULT``) receive ``store=False`` for their attempt unless the request sets ``store`` explicitly.
+    Agents using this client keep history locally, as they do for any client that does not store history by default.
+
+    Reasoning is provider-specific: a provider can only replay reasoning it produced itself (for example, OpenAI
+    requires its encrypted reasoning payload). This client records which client produced each response's reasoning
+    and omits that reasoning from the copy of the conversation sent to a different client, together with the
+    compaction flag that marks its group as containing reasoning. Function calls and results are always sent, and the
+    caller's transcript is never modified. Reasoning in history that this client did not record (for example, from
+    an earlier streamed run) is sent unchanged.
 
     The chat clients are caller-owned: ``close()`` and ``async with`` do not close them.
 
@@ -142,14 +199,36 @@ class FailoverChatClient(
                 )
         self._clients = candidates
         self._should_failover = should_failover
+
         continuation_option_names = {"conversation_id"}
         for candidate in candidates:
-            declared = getattr(candidate, "SERVICE_CONTINUATION_OPTION_NAMES", ())
+            # A nested failover client must contribute its own candidates' names, not the inherited default.
+            declared = (
+                candidate._continuation_option_names
+                if isinstance(candidate, FailoverChatClient)
+                else getattr(candidate, "SERVICE_CONTINUATION_OPTION_NAMES", ())
+            )
             if isinstance(declared, Sequence) and not isinstance(declared, (str, bytes, bytearray)):
                 continuation_option_names.update(
                     name for name in cast(Sequence[Any], declared) if isinstance(name, str)
                 )
         self._continuation_option_names = tuple(sorted(continuation_option_names))
+
+        # Reasoning recorded with one of a candidate's sources is replayed to that candidate. A nested failover
+        # client records its own candidates' sources, so it accepts all of them.
+        candidate_sources: list[str | None] = []
+        accepted_sources: list[frozenset[str]] = []
+        for candidate in candidates:
+            if isinstance(candidate, FailoverChatClient):
+                candidate_sources.append(None)
+                accepted_sources.append(candidate._all_sources)
+            else:
+                source = _client_source(candidate)
+                candidate_sources.append(source)
+                accepted_sources.append(frozenset({source}))
+        self._candidate_sources = tuple(candidate_sources)
+        self._accepted_sources = tuple(accepted_sources)
+        self._all_sources: frozenset[str] = frozenset[str]().union(*accepted_sources)
         super().__init__(
             middleware=middleware,
             function_invocation_configuration=function_invocation_configuration,
@@ -163,6 +242,103 @@ class FailoverChatClient(
         """The chat clients tried for each model call, in order."""
         return self._clients
 
+    @overload
+    def get_response(
+        self,
+        messages: Sequence[Message],
+        *,
+        stream: Literal[False] = ...,
+        options: ChatOptions[ResponseModelBoundT],
+        middleware: Sequence[ChatAndFunctionMiddlewareTypes] | None = None,
+        compaction_strategy: CompactionStrategy | None = None,
+        tokenizer: TokenizerProtocol | None = None,
+        function_invocation_kwargs: Mapping[str, Any] | None = None,
+        client_kwargs: Mapping[str, Any] | None = None,
+    ) -> Awaitable[ChatResponse[ResponseModelBoundT]]: ...
+
+    @overload
+    def get_response(
+        self,
+        messages: Sequence[Message],
+        *,
+        stream: Literal[False] = ...,
+        options: OptionsCoT | ChatOptions[None] | None = None,
+        middleware: Sequence[ChatAndFunctionMiddlewareTypes] | None = None,
+        compaction_strategy: CompactionStrategy | None = None,
+        tokenizer: TokenizerProtocol | None = None,
+        function_invocation_kwargs: Mapping[str, Any] | None = None,
+        client_kwargs: Mapping[str, Any] | None = None,
+    ) -> Awaitable[ChatResponse[Any]]: ...
+
+    @overload
+    def get_response(
+        self,
+        messages: Sequence[Message],
+        *,
+        stream: Literal[True],
+        options: OptionsCoT | ChatOptions[Any] | None = None,
+        middleware: Sequence[ChatAndFunctionMiddlewareTypes] | None = None,
+        compaction_strategy: CompactionStrategy | None = None,
+        tokenizer: TokenizerProtocol | None = None,
+        function_invocation_kwargs: Mapping[str, Any] | None = None,
+        client_kwargs: Mapping[str, Any] | None = None,
+    ) -> ResponseStream[ChatResponseUpdate, ChatResponse[Any]]: ...
+
+    def get_response(
+        self,
+        messages: Sequence[Message],
+        *,
+        stream: bool = False,
+        options: OptionsCoT | ChatOptions[Any] | None = None,
+        middleware: Sequence[ChatAndFunctionMiddlewareTypes] | None = None,
+        compaction_strategy: CompactionStrategy | None = None,
+        tokenizer: TokenizerProtocol | None = None,
+        function_invocation_kwargs: Mapping[str, Any] | None = None,
+        client_kwargs: Mapping[str, Any] | None = None,
+    ) -> Awaitable[ChatResponse[Any]] | ResponseStream[ChatResponseUpdate, ChatResponse[Any]]:
+        """Get a response, failing over to the next chat client for each model call that fails.
+
+        Args:
+            messages: The messages to send.
+
+        Keyword Args:
+            stream: Whether to stream the response.
+            options: Chat options forwarded to each attempted client.
+            middleware: Additional chat and function middleware for this request.
+            compaction_strategy: Optional per-call compaction override.
+            tokenizer: Optional per-call tokenizer override.
+            function_invocation_kwargs: Keyword arguments forwarded only to tool invocations.
+            client_kwargs: Additional client keyword arguments forwarded to each attempted client.
+
+        Returns:
+            When ``stream`` is ``False``, an awaitable response; otherwise a response stream.
+
+        Raises:
+            ChatClientInvalidRequestException: If ``options`` set ``store=True`` or carry a service-managed
+                continuation. This is raised before any approved tool runs or any client is called.
+        """
+        # Reject service-managed history before the inherited loop resolves approvals, which can run tools
+        # without a model call. The per-model-call check in _inner_get_response still covers middleware changes.
+        self._ensure_client_managed_history(cast("Mapping[str, Any] | None", options) or {})
+        forwarded_client_kwargs = dict(client_kwargs) if client_kwargs is not None else {}
+        if (session := forwarded_client_kwargs.get("session")) is not None:
+            # This client's chat middleware layer consumes "session"; carry it to the candidates' chat layers.
+            forwarded_client_kwargs[_CANDIDATE_SESSION_KEY] = session
+        get_response = cast("Callable[..., Any]", super().get_response)
+        return cast(
+            "Awaitable[ChatResponse[Any]] | ResponseStream[ChatResponseUpdate, ChatResponse[Any]]",
+            get_response(
+                messages,
+                stream=stream,
+                options=options,
+                middleware=middleware,
+                compaction_strategy=compaction_strategy,
+                tokenizer=tokenizer,
+                function_invocation_kwargs=function_invocation_kwargs,
+                client_kwargs=forwarded_client_kwargs,
+            ),
+        )
+
     def _inner_get_response(
         self,
         *,
@@ -171,9 +347,12 @@ class FailoverChatClient(
         options: Mapping[str, Any],
         **kwargs: Any,
     ) -> Awaitable[ChatResponse] | ResponseStream[ChatResponseUpdate, ChatResponse]:
+        client_kwargs = dict(kwargs)
+        if (session := client_kwargs.pop(_CANDIDATE_SESSION_KEY, None)) is not None:
+            client_kwargs["session"] = session
         if stream:
-            return self._stream_with_failover(messages=messages, options=options, client_kwargs=kwargs)
-        return self._get_response_with_failover(messages=messages, options=options, client_kwargs=kwargs)
+            return self._stream_with_failover(messages=messages, options=options, client_kwargs=client_kwargs)
+        return self._get_response_with_failover(messages=messages, options=options, client_kwargs=client_kwargs)
 
     async def _get_response_with_failover(
         self,
@@ -186,16 +365,19 @@ class FailoverChatClient(
         last_index = len(self._clients) - 1
         for index, client in enumerate(self._clients):
             try:
-                return await cast(
+                response = await cast(
                     "Awaitable[ChatResponse]",
                     self._call_client(
-                        client, messages=messages, stream=False, options=options, client_kwargs=client_kwargs
+                        index, messages=messages, stream=False, options=options, client_kwargs=client_kwargs
                     ),
                 )
             except Exception as exception:
                 if index == last_index or not self._is_failover_allowed(exception):
                     raise
                 self._log_failover(index, client, exception)
+                continue
+            self._record_reasoning_source(index, response)
+            return response
         raise AssertionError("unreachable")  # pragma: no cover
 
     def _stream_with_failover(
@@ -217,7 +399,7 @@ class FailoverChatClient(
                     attempt = await cast(
                         "ResponseStream[ChatResponseUpdate, ChatResponse]",
                         self._call_client(
-                            client, messages=messages, stream=True, options=options, client_kwargs=client_kwargs
+                            index, messages=messages, stream=True, options=options, client_kwargs=client_kwargs
                         ),
                     )
                 except Exception as exception:
@@ -258,6 +440,7 @@ class FailoverChatClient(
                     final_response = await attempt.get_final_response()
                 for held_update in held:
                     yield held_update
+                self._record_reasoning_source(index, final_response)
                 final_responses.append(final_response)
                 return
 
@@ -271,14 +454,15 @@ class FailoverChatClient(
 
     def _call_client(
         self,
-        client: SupportsChatGetResponse[Any],
+        index: int,
         *,
         messages: Sequence[Message],
         stream: bool,
         options: Mapping[str, Any],
         client_kwargs: Mapping[str, Any],
     ) -> Awaitable[ChatResponse[Any]] | ResponseStream[ChatResponseUpdate, ChatResponse[Any]]:
-        """Run one model call on ``client`` without its function-invocation loop."""
+        """Run one model call on the client at ``index`` without its function-invocation loop."""
+        client = self._clients[index]
         attempt_options = dict(options)
         if getattr(client, "STORES_BY_DEFAULT", False) is True and attempt_options.get("store") is None:
             attempt_options["store"] = False
@@ -292,11 +476,55 @@ class FailoverChatClient(
             target.get_response,
         )
         return get_response(
-            messages=messages,
+            messages=self._messages_for_client(index, messages),
             stream=stream,
             options=attempt_options,
             client_kwargs=dict(client_kwargs),
         )
+
+    def _record_reasoning_source(self, index: int, response: ChatResponse[Any]) -> None:
+        """Record which client produced the reasoning in ``response``, keeping a nested client's record."""
+        source = self._candidate_sources[index]
+        if source is None:
+            return
+        for message in response.messages:
+            if any(content.type == "text_reasoning" for content in message.contents):
+                message.additional_properties.setdefault(_FAILOVER_METADATA_KEY, {"source": source})
+
+    def _messages_for_client(self, index: int, messages: Sequence[Message]) -> Sequence[Message]:
+        """Return the conversation to send to the client at ``index``.
+
+        Reasoning recorded as produced by a different client is omitted, along with the compaction flag that marks
+        its group as containing reasoning. The caller's messages are not modified; unchanged conversations are
+        returned as-is.
+        """
+        accepted = self._accepted_sources[index]
+        projected: list[Message] | None = None
+        foreign_groups: set[Any] = set()
+        for position, message in enumerate(messages):
+            source = _message_source(message)
+            if source is None or source in accepted:
+                continue
+            if not any(content.type == "text_reasoning" for content in message.contents):
+                continue
+            if projected is None:
+                projected = list(messages)
+            annotation = _group_annotation(message)
+            if annotation is not None and annotation.get(GROUP_ID_KEY) is not None:
+                foreign_groups.add(annotation[GROUP_ID_KEY])
+            projected[position] = _without_reasoning(message)
+        if projected is None:
+            return messages
+        if foreign_groups:
+            for position, message in enumerate(projected):
+                annotation = _group_annotation(message)
+                if (
+                    annotation is not None
+                    and annotation.get(GROUP_ID_KEY) in foreign_groups
+                    and annotation.get(GROUP_HAS_REASONING_KEY) is True
+                ):
+                    projected[position] = _without_reasoning(message)
+        return [message for message in projected if message.contents]
 
     def _ensure_client_managed_history(self, options: Mapping[str, Any]) -> None:
         if options.get("store") is True:
