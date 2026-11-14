@@ -113,6 +113,7 @@ _LAZY_MODULE_EXPORTS: Final[Mapping[str, tuple[str, ...]]] = {
         "tool_called_check",
         "tool_calls_present",
     ),
+    "._failover": ("FailoverChatClient",),
     "._feature_stage": ("ExperimentalFeature", "ReleaseCandidateFeature"),
     "._harness._agent": ("DEFAULT_HARNESS_INSTRUCTIONS", "create_harness_agent"),
     "._harness._background_agents": (
@@ -514,6 +515,7 @@ __all__ = [
     "Executor",
     "ExpectedToolCall",
     "ExperimentalFeature",
+    "FailoverChatClient",
     "FanInEdgeGroup",
     "FanOutEdgeGroup",
     "FieldTypes",

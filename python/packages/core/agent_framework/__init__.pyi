@@ -75,6 +75,7 @@ from ._evaluation import (
     tool_called_check,
     tool_calls_present,
 )
+from ._failover import FailoverChatClient
 from ._feature_stage import ExperimentalFeature, ReleaseCandidateFeature
 from ._harness._agent import DEFAULT_HARNESS_INSTRUCTIONS, create_harness_agent
 from ._harness._background_agents import (
@@ -469,6 +470,7 @@ __all__ = [
     "Executor",
     "ExpectedToolCall",
     "ExperimentalFeature",
+    "FailoverChatClient",
     "FanInEdgeGroup",
     "FanOutEdgeGroup",
     "FieldTypes",

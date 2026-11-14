@@ -7,6 +7,7 @@ This folder contains examples for direct chat client usage patterns.
 | File | Description |
 |------|-------------|
 | [`built_in_chat_clients.py`](built_in_chat_clients.py) | Consolidated sample for built-in chat clients. Passes a client name to `main()`, which creates the selected client with `get_client()`. |
+| [`chat_client_failover.py`](chat_client_failover.py) | Demonstrates `FailoverChatClient`, which retries each model call on the next chat client when one fails, without re-running tools that already ran. Uses `FoundryChatClient` with a deliberately invalid primary deployment so the failover is visible. |
 | [`chat_response_cancellation.py`](chat_response_cancellation.py) | Demonstrates how to cancel chat responses during streaming, showing proper cancellation handling and cleanup. |
 | [`custom_chat_client.py`](custom_chat_client.py) | Demonstrates how to create custom chat clients by extending the `BaseChatClient` class. Shows a `EchoingChatClient` implementation and how to integrate it with `Agent` using the `as_agent()` method. |
 | [`require_per_service_call_history_persistence.py`](require_per_service_call_history_persistence.py) | Compares two otherwise identical `FoundryChatClient` agents with `store=False`; the only difference is whether `require_per_service_call_history_persistence` is enabled, and only the run without it stores the synthesized tool result when middleware terminates the loop early. |
@@ -36,7 +37,7 @@ Example:
 uv run samples/02-agents/chat_client/built_in_chat_clients.py
 ```
 
-The `require_per_service_call_history_persistence.py` sample uses `FoundryChatClient`, so set the usual Foundry settings first and sign in with the Azure CLI:
+The `require_per_service_call_history_persistence.py` and `chat_client_failover.py` samples use `FoundryChatClient`, so set the usual Foundry settings first and sign in with the Azure CLI:
 
 ```bash
 export FOUNDRY_PROJECT_ENDPOINT="https://<your-project>.services.ai.azure.com/api/projects/<project-name>"

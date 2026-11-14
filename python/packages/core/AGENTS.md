@@ -71,6 +71,18 @@ agent_framework/
   for streaming and non-streaming requests. Provides `__aenter__()` returning `self`, `__aexit__()` delegating to
   `close()`, and a default no-op async `close()`. Connectors override cleanup for owned connections and credentials;
   injected resources remain caller-owned. `SupportsChatGetResponse` does not require lifecycle methods.
+- **`FailoverChatClient`** (`_failover.py`, experimental under `CHAT_CLIENT_FAILOVER`) - Tries an ordered list of
+  chat clients for each model call. It owns the single function-invocation loop and calls each candidate below that
+  candidate's `FunctionInvocationLayer` (the same entry the candidate's own loop uses per model call), so candidate
+  chat middleware and telemetry run per attempt while tools run once, in the failover client's loop. A failure after
+  earlier model calls requested tools therefore never re-executes them. Every model call starts again with the first
+  client. Any `Exception` fails over unless `should_failover` returns `False`; cancellation is never caught, and
+  `ResponseInvalidatedException` and `MiddlewareException` always propagate. Streaming fails over only before an
+  update with contents is released; content-less updates are held until then and discarded with a failed attempt.
+  History must be client-managed: `store=True` or a service continuation option (the union of candidates'
+  `SERVICE_CONTINUATION_OPTION_NAMES`) raises `ChatClientInvalidRequestException` before any call, and candidates
+  with `STORES_BY_DEFAULT` receive `store=False` per attempt when `store` is unset. Candidates are caller-owned and
+  not closed.
 
 ### Types (`_types.py`)
 
